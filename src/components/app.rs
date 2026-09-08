@@ -41,7 +41,7 @@ use cosmic_settings_upower_subscription::kbdbacklight::{
 use logind_zbus::manager::ManagerProxy;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::process::Stdio;
 use std::rc::Rc;
@@ -72,8 +72,11 @@ pub struct Args {
 pub enum OsdTask {
     #[clap(about = "Display external display toggle indicator")]
     Display,
-    #[clap(about = "Show numbers on all displays for identification")]
-    IdentifyDisplays,
+    #[clap(about = "Show numbers on the named displays for identification")]
+    IdentifyDisplays {
+        #[arg(required = true, num_args = 2..)]
+        outputs: Vec<String>,
+    },
     #[clap(about = "Dismiss display identification numbers")]
     DismissDisplayIdentifiers,
     #[clap(about = "Toggle the on screen display and start the log out timer")]
@@ -119,7 +122,7 @@ impl OsdTask {
             }
             OsdTask::Touchpad => Task::none(),
             OsdTask::Display => Task::none(),
-            OsdTask::IdentifyDisplays => Task::none(),
+            OsdTask::IdentifyDisplays { .. } => Task::none(),
             OsdTask::DismissDisplayIdentifiers => Task::none(),
         }
     }
@@ -175,6 +178,104 @@ impl FromStr for OsdTask {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         serde_json::de::from_str(s)
+    }
+}
+
+fn display_identifier_request_ready(
+    displays: &[(String, u32)],
+    mut is_available: impl FnMut(&str) -> bool,
+) -> bool {
+    displays.len() >= 2 && displays.iter().all(|(name, _)| is_available(name))
+}
+
+fn display_identifiers(
+    outputs: &[String],
+    mut is_available: impl FnMut(&str) -> bool,
+) -> Vec<(String, u32)> {
+    let mut seen = HashSet::new();
+    let names = outputs
+        .iter()
+        .filter(|name| seen.insert(name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if names.len() < 2 || names.iter().any(|name| !is_available(name)) {
+        return Vec::new();
+    }
+
+    names
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| (name, (index + 1) as u32))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Args, OsdTask, display_identifier_request_ready, display_identifiers};
+    use clap::Parser;
+    use std::str::FromStr;
+
+    #[test]
+    fn parses_ordered_display_identifiers() {
+        let args =
+            Args::try_parse_from(["cosmic-osd", "identify-displays", "DP-1", "HDMI-A-1"]).unwrap();
+
+        let Some(OsdTask::IdentifyDisplays { outputs }) = args.subcommand else {
+            panic!("expected identify displays action");
+        };
+        assert_eq!(outputs, ["DP-1", "HDMI-A-1"]);
+    }
+
+    #[test]
+    fn requires_two_display_identifiers() {
+        assert!(Args::try_parse_from(["cosmic-osd", "identify-displays", "DP-1"]).is_err());
+    }
+
+    #[test]
+    fn serializes_display_names_in_the_identify_action() {
+        let action = OsdTask::IdentifyDisplays {
+            outputs: vec!["DP-1".into(), "HDMI-A-1".into()],
+        };
+        let parsed = OsdTask::from_str(&action.to_string()).unwrap();
+
+        let OsdTask::IdentifyDisplays { outputs } = parsed else {
+            panic!("expected identify displays action");
+        };
+        assert_eq!(outputs, ["DP-1", "HDMI-A-1"]);
+    }
+
+    #[test]
+    fn fails_closed_when_a_requested_display_is_unavailable() {
+        let displays =
+            display_identifiers(&["DP-2".into(), "DP-1".into(), "HDMI-A-1".into()], |name| {
+                name != "DP-1"
+            });
+
+        assert!(displays.is_empty());
+    }
+
+    #[test]
+    fn rejects_a_queued_request_after_an_output_disappears() {
+        let displays = vec![("DP-1".into(), 1), ("HDMI-A-1".into(), 2)];
+
+        assert!(!display_identifier_request_ready(&displays, |name| name != "DP-1"));
+    }
+
+    #[test]
+    fn ignores_duplicate_display_identifiers() {
+        let displays =
+            display_identifiers(&["DP-1".into(), "DP-1".into(), "HDMI-A-1".into()], |_| true);
+
+        assert_eq!(displays, vec![("DP-1".into(), 1), ("HDMI-A-1".into(), 2)]);
+    }
+
+    #[test]
+    fn omits_identifiers_when_fewer_than_two_displays_resolve() {
+        let displays =
+            display_identifiers(&["DP-1".into(), "HDMI-A-1".into()], |name| name == "DP-1");
+
+        assert!(displays.is_empty());
     }
 }
 
@@ -471,51 +572,9 @@ impl App {
         Task::batch(cmds)
     }
 
-    fn trigger_identify_displays(&self) -> cosmic::app::Task<Msg> {
-        cosmic::task::future(async move {
-            // Add a small delay to allow cosmic-randr to sync with display changes
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-            let Ok(output_lists) = cosmic_randr_shell::list().await else {
-                log::error!("Failed to list displays with cosmic-randr");
-                return Msg::CreateDisplayIdentifiers(Vec::new());
-            };
-
-            // Get all enabled outputs and number them the same way cosmic-settings does:
-            // Sort alphabetically by output name, then assign numbers 1, 2, 3...
-            use std::collections::BTreeMap;
-
-            let sorted_outputs: BTreeMap<&str, _> = output_lists
-                .outputs
-                .iter()
-                .filter(|(_, o)| o.enabled)
-                .map(|(key, output)| (output.name.as_str(), (key, output)))
-                .collect();
-
-            let displays: Vec<(String, u32)> = sorted_outputs
-                .into_iter()
-                .enumerate()
-                .map(|(index, (name, _))| (name.to_string(), (index + 1) as u32))
-                .collect();
-
-            log::debug!(
-                "Identified {} enabled displays: {:?}",
-                displays.len(),
-                displays
-            );
-
-            // Only show identifiers if there are 2 or more displays
-            if displays.len() < 2 {
-                log::info!(
-                    "Skipping display identifiers: only {} enabled display(s)",
-                    displays.len()
-                );
-                return Msg::CreateDisplayIdentifiers(Vec::new());
-            }
-
-            Msg::CreateDisplayIdentifiers(displays)
-        })
-        .map(cosmic::Action::App)
+    fn trigger_identify_displays(&self, outputs: &[String]) -> cosmic::app::Task<Msg> {
+        let displays = display_identifiers(outputs, |name| self.wayland_outputs.contains_key(name));
+        Task::done(cosmic::Action::App(Msg::CreateDisplayIdentifiers(displays)))
     }
 
     fn update_xkb(&self, xkb: &XkbConfig) -> Vec<ActiveLayout> {
@@ -605,6 +664,7 @@ impl cosmic::Application for App {
             wayland_outputs: HashMap::new(),
             display_identifier_displays: HashMap::new(),
             identifiers_dismissed: false,
+
             dummy_id: None,
             margin: IcedMargin::default(),
             layouts,
@@ -628,10 +688,9 @@ impl cosmic::Application for App {
         match message {
             Msg::Action(action) => {
                 // Some actions don't require confirmation and execute immediately
-                if matches!(action, OsdTask::IdentifyDisplays) {
-                    // Clear dismissed flag to allow showing identifiers
+                if let OsdTask::IdentifyDisplays { outputs } = &action {
                     self.identifiers_dismissed = false;
-                    self.trigger_identify_displays()
+                    self.trigger_identify_displays(outputs)
                 } else if matches!(action, OsdTask::DismissDisplayIdentifiers) {
                     Task::done(cosmic::Action::App(Msg::DismissDisplayIdentifiers))
                 } else if matches!(action, OsdTask::Restart)
@@ -963,9 +1022,9 @@ impl cosmic::Application for App {
                     log::debug!("Display '{}' added to wayland outputs tracking", name);
                 }
                 if self.dummy_id.is_none() {
-                    return self.create_dummy_layer_surface();
+                    self.create_dummy_layer_surface()
                 } else {
-                    return Task::none();
+                    Task::none()
                 }
             }
             Msg::OutputRemoved(output) => {
@@ -981,12 +1040,16 @@ impl cosmic::Application for App {
                 });
 
                 if let Some(name) = removed_name {
-                    log::info!(
-                        "Display '{}' disconnected, updating display identifiers",
-                        name
-                    );
-                    // Trigger display identifier OSD to show the updated numbering
-                    Task::done(cosmic::Action::App(Msg::Action(OsdTask::IdentifyDisplays)))
+                    log::info!("Display '{}' disconnected", name);
+                    let identifiers = self
+                        .display_identifier_displays
+                        .drain()
+                        .map(|(id, _)| {
+                            self.surfaces.remove(&id);
+                            destroy_layer_surface(id)
+                        })
+                        .collect::<Vec<_>>();
+                    Task::batch(identifiers)
                 } else {
                     log::warn!(
                         "OutputRemoved event received but display not found in wayland_outputs"
@@ -995,16 +1058,25 @@ impl cosmic::Application for App {
                 }
             }
             Msg::CreateDisplayIdentifiers(displays) => {
-                if displays.is_empty() {
-                    log::warn!("CreateDisplayIdentifiers called with empty display list");
-                    return Task::none();
-                }
-
                 if self.identifiers_dismissed {
                     log::debug!(
                         "Ignoring CreateDisplayIdentifiers: identifiers were explicitly dismissed"
                     );
                     return Task::none();
+                }
+
+                if !display_identifier_request_ready(&displays, |name| {
+                    self.wayland_outputs.contains_key(name)
+                }) {
+                    let tasks = self
+                        .display_identifier_displays
+                        .drain()
+                        .map(|(id, _)| {
+                            self.surfaces.remove(&id);
+                            destroy_layer_surface(id)
+                        })
+                        .collect::<Vec<_>>();
+                    return Task::batch(tasks);
                 }
 
                 log::info!(
@@ -1070,16 +1142,11 @@ impl cosmic::Application for App {
                                 display_number
                             );
 
-                            let iced_output =
-                                if let Some((output, _)) = self.wayland_outputs.get(display_name) {
-                                    IcedOutput::Output(output.clone())
-                                } else {
-                                    log::warn!(
-                                        "Display '{}' not found in wayland_outputs",
-                                        display_name
-                                    );
-                                    IcedOutput::Active
-                                };
+                            let Some((output, _)) = self.wayland_outputs.get(display_name) else {
+                                log::warn!("Display '{}' is no longer available", display_name);
+                                continue;
+                            };
+                            let iced_output = IcedOutput::Output(output.clone());
 
                             let (state, cmd) = osd_indicator::State::new_with_output(
                                 id,
@@ -1102,14 +1169,11 @@ impl cosmic::Application for App {
                             display_number
                         );
 
-                        let iced_output = if let Some((output, _)) =
-                            self.wayland_outputs.get(display_name)
-                        {
-                            IcedOutput::Output(output.clone())
-                        } else {
-                            log::warn!("Display '{}' not found in wayland_outputs", display_name);
-                            IcedOutput::Active
+                        let Some((output, _)) = self.wayland_outputs.get(display_name) else {
+                            log::warn!("Display '{}' is no longer available", display_name);
+                            continue;
                         };
+                        let iced_output = IcedOutput::Output(output.clone());
 
                         let (state, cmd) = osd_indicator::State::new_with_output(
                             id,
@@ -1365,7 +1429,7 @@ impl cosmic::Application for App {
                 OsdTask::ConfirmHeadphones { .. } => "confirm-device-type",
                 OsdTask::Touchpad => "touchpad",
                 OsdTask::Display => "external-display",
-                OsdTask::IdentifyDisplays => "identify-displays",
+                OsdTask::IdentifyDisplays { .. } => "identify-displays",
                 OsdTask::DismissDisplayIdentifiers => "dismiss-display-identifiers",
             };
 
@@ -1662,10 +1726,9 @@ impl cosmic::Application for App {
 
                         Msg::Display(enabled)
                     });
-                } else if let OsdTask::IdentifyDisplays = cmd {
-                    // Clear dismissed flag to allow showing identifiers
+                } else if let OsdTask::IdentifyDisplays { outputs } = cmd {
                     self.identifiers_dismissed = false;
-                    return self.trigger_identify_displays();
+                    return self.trigger_identify_displays(&outputs);
                 } else if let OsdTask::DismissDisplayIdentifiers = cmd {
                     return Task::done(cosmic::Action::App(Msg::DismissDisplayIdentifiers));
                 }
